@@ -4,107 +4,151 @@ param(
     [string]$LogPath = "$PSScriptRoot\kms_cleanup.log"
 )
 
+# =========================
+# ENCODING FIX
+# =========================
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-function Log($msg) {
+# =========================
+# LOGGER
+# =========================
+function Log {
+    param([string]$msg)
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts] $msg"
     Write-Host $line
     Add-Content -Path $LogPath -Value $line
 }
 
-function Confirm-Step($msg) {
+# =========================
+# CONFIRM
+# =========================
+function Confirm {
+    param([string]$msg)
     if ($AutoApprove) { return $true }
-    $a = Read-Host "$msg (y/n)"
-    return $a -eq "y"
+    $ans = Read-Host "$msg (y/n)"
+    return $ans -eq "y"
 }
 
-function Section($name) {
-    Log ""
-    Log "=== $name ==="
-}
+# =========================
+# SLMGR WRAPPER
+# =========================
+function Run-Slmgr {
+    param([string]$args)
 
-function Run-Slmgr($args) {
     $output = cscript.exe $env:SystemRoot\System32\slmgr.vbs $args 2>&1
 
     if ($output -match "0xC004D302") {
-        Log "slmgr $args → skipped (rearm limit reached)"
-    } else {
-        Log "slmgr $args → done"
+        Log "slmgr $args -> skipped (rearm limit reached)"
+    }
+    else {
+        Log "slmgr $args -> executed"
     }
 }
 
 # =========================
-# AUDIT
+# SECTION HEADER
 # =========================
+function Section {
+    param([string]$name)
+    Log ""
+    Log "=============================="
+    Log $name
+    Log "=============================="
+}
 
-$Report = @{}
+# =========================
+# CONFIG
+# =========================
+$Patterns = "KMS|AutoKMS|AAct|Pico"
 
-Section "Audit: Scheduled Tasks"
+# =========================
+# AUDIT START
+# =========================
+Section "AUDIT: Scheduled Tasks"
+
 $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
-    $_.TaskName -match "KMS|AutoKMS|AAct"
+    $_.TaskName -match $Patterns
 }
-$Report.Tasks = $tasks
-if ($tasks) { $tasks | % { Log "Task: $($_.TaskName)" } } else { Log "OK" }
 
-Section "Audit: Services"
-$services = Get-Service -ErrorAction SilentlyContinue | Where-Object {
-    $_.Name -match "KMS|AAct"
+if ($tasks) {
+    $tasks | ForEach-Object {
+        Log "Task found: $($_.TaskName)"
+    }
+} else {
+    Log "No suspicious tasks"
 }
-$Report.Services = $services
-if ($services) { $services | % { Log "Service: $($_.Name)" } } else { Log "OK" }
 
-Section "Audit: Run keys"
-$runFindings = @()
-$paths = @(
- "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
- "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+Section "AUDIT: Services"
+
+$services = Get-CimInstance Win32_Service | Where-Object {
+    $_.Name -match $Patterns -or $_.PathName -match $Patterns
+}
+
+if ($services) {
+    $services | ForEach-Object {
+        Log "Service found: $($_.Name) | $($_.PathName)"
+    }
+} else {
+    Log "No suspicious services"
+}
+
+Section "AUDIT: Run Keys"
+
+$runHits = @()
+
+$runPaths = @(
+"HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 )
 
-foreach ($p in $paths) {
+foreach ($p in $runPaths) {
     if (Test-Path $p) {
         $props = Get-ItemProperty $p
         foreach ($prop in $props.PSObject.Properties) {
-            if ($prop.Value -match "KMS|AAct") {
-                $runFindings += "$($prop.Name) => $($prop.Value)"
+            if ($prop.Value -match $Patterns) {
+                $runHits += "$($prop.Name) => $($prop.Value)"
             }
         }
     }
 }
-$Report.Run = $runFindings
-if ($runFindings) { $runFindings | % { Log "Run: $_" } } else { Log "OK" }
 
-Section "Audit: Defender exclusions"
-$def = Get-MpPreference
-if ($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension -or $def.ExclusionIpAddress) {
-    $def.ExclusionPath | % { Log "Path: $_" }
-    $def.ExclusionProcess | % { Log "Process: $_" }
-    $def.ExclusionExtension | % { Log "Ext: $_" }
-    $def.ExclusionIpAddress | % { Log "IP: $_" }
+if ($runHits.Count -gt 0) {
+    $runHits | ForEach-Object { Log "Run entry: $_" }
 } else {
-    Log "OK"
+    Log "No Run entries"
 }
 
-Section "Audit: Defender status"
+Section "AUDIT: Defender Exclusions"
+
+$def = Get-MpPreference
+
+if ($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension) {
+    $def.ExclusionPath | ForEach-Object { Log "Path exclusion: $_" }
+    $def.ExclusionProcess | ForEach-Object { Log "Process exclusion: $_" }
+    $def.ExclusionExtension | ForEach-Object { Log "Extension exclusion: $_" }
+} else {
+    Log "No Defender exclusions"
+}
+
+Section "AUDIT: Defender Status"
+
 $defSvc = Get-Service WinDefend -ErrorAction SilentlyContinue
-$Report.DefenderService = $defSvc
 
 if ($defSvc) {
-    Log "Status=$($defSvc.Status) Startup=$($defSvc.StartType)"
+    Log "Defender: $($defSvc.Status) / $($defSvc.StartType)"
 } else {
-    Log "Not found"
+    Log "Defender service missing"
 }
-
-Section "Audit finished"
 
 # =========================
 # REMEDIATION
 # =========================
+Section "REMEDIATION"
 
-Section "Remediation"
-
-if ($Report.Tasks -and (Confirm-Step "Delete scheduled tasks?")) {
-    foreach ($t in $Report.Tasks) {
+# ---- Tasks ----
+if ($tasks -and (Confirm "Remove scheduled tasks?")) {
+    foreach ($t in $tasks) {
         Log "Deleting task: $($t.TaskName)"
         if (-not $DryRun) {
             Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false
@@ -112,8 +156,9 @@ if ($Report.Tasks -and (Confirm-Step "Delete scheduled tasks?")) {
     }
 }
 
-if ($Report.Services -and (Confirm-Step "Delete services?")) {
-    foreach ($s in $Report.Services) {
+# ---- Services ----
+if ($services -and (Confirm "Remove services?")) {
+    foreach ($s in $services) {
         Log "Deleting service: $($s.Name)"
         if (-not $DryRun) {
             Stop-Service $s.Name -Force -ErrorAction SilentlyContinue
@@ -122,40 +167,36 @@ if ($Report.Services -and (Confirm-Step "Delete services?")) {
     }
 }
 
-if ($Report.Run -and (Confirm-Step "Clean Run keys?")) {
-    foreach ($entry in $Report.Run) {
-        Log "Found: $entry"
-    }
-}
-
-if (($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension -or $def.ExclusionIpAddress) -and (Confirm-Step "Clear Defender exclusions?")) {
-    if (-not $DryRun) {
-        $def.ExclusionPath | % { Remove-MpPreference -ExclusionPath $_ }
-        $def.ExclusionProcess | % { Remove-MpPreference -ExclusionProcess $_ }
-        $def.ExclusionExtension | % { Remove-MpPreference -ExclusionExtension $_ }
-        $def.ExclusionIpAddress | % { Remove-MpPreference -ExclusionIpAddress $_ }
-    }
-}
-
-# Defender — только если реально нужно
-if ($Report.DefenderService) {
-    if ($Report.DefenderService.Status -eq "Running" -and $Report.DefenderService.StartType -eq "Automatic") {
-        Log "Defender OK — skipping"
+# ---- Defender ----
+if ($defSvc) {
+    if ($defSvc.Status -eq "Running") {
+        Log "Defender OK -> skip enable"
     } else {
-        if (Confirm-Step "Enable Defender?")) {
+        if (Confirm "Enable Defender?") {
             try {
                 if (-not $DryRun) {
                     Set-Service WinDefend -StartupType Automatic
                     Start-Service WinDefend
+                    Set-MpPreference -DisableRealtimeMonitoring $false
                 }
             } catch {
-                Log "Access denied (Tamper Protection?)"
+                Log "Defender blocked (Tamper Protection likely)"
             }
         }
     }
 }
 
-if (Confirm-Step "Reset Windows activation?") {
+# ---- Exclusions ----
+if (($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension) -and (Confirm "Clear Defender exclusions?")) {
+    if (-not $DryRun) {
+        $def.ExclusionPath | ForEach-Object { Remove-MpPreference -ExclusionPath $_ }
+        $def.ExclusionProcess | ForEach-Object { Remove-MpPreference -ExclusionProcess $_ }
+        $def.ExclusionExtension | ForEach-Object { Remove-MpPreference -ExclusionExtension $_ }
+    }
+}
+
+# ---- Activation ----
+if (Confirm "Reset Windows activation?") {
     if (-not $DryRun) {
         Run-Slmgr "/upk"
         Run-Slmgr "/ckms"
@@ -163,4 +204,5 @@ if (Confirm-Step "Reset Windows activation?") {
     }
 }
 
-Log "=== DONE. Reboot recommended ==="
+Section "DONE"
+Log "Reboot recommended"
