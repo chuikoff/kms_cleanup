@@ -62,3 +62,60 @@ Group Policy
 
 Перезагрузить компьютер
 Активировать Windows легальным ключом
+
+English Version
+📌 Description
+
+PowerShell script designed to remove traces of KMS activators (such as AAct, KMSAuto, etc.) and restore Windows security settings.
+
+Workflow:
+
+audit → confirmation → remediation
+
+🔧 Features
+Pre-change system audit
+Interactive confirmation for each action
+Removes:
+Scheduled tasks
+Services
+Run entries
+Windows Defender exclusions
+Checks Defender status
+Restores Defender if disabled
+Resets Windows activation (removes KMS)
+Full logging to file
+⚙️ Usage
+1. Allow script execution (temporary)
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+2. Dry run (recommended)
+.\kms_cleanup.ps1 -DryRun
+
+Shows planned actions without making changes.
+
+3. Interactive mode
+.\kms_cleanup.ps1
+
+Prompts for confirmation before each action.
+
+4. Automatic mode
+.\kms_cleanup.ps1 -AutoApprove
+
+Runs without prompts.
+
+🛡️ Notes
+Defender is not modified if already running correctly
+Handles PowerShell edge cases safely
+Prevents null/empty argument errors
+Some actions may be limited by:
+Tamper Protection
+Group Policy
+⚠️ Limitations
+Not a full antivirus solution
+Does not detect advanced persistence techniques (e.g. WMI, rootkits)
+May not remove manually installed activator components
+🔄 After running
+
+Recommended:
+
+Reboot system
+Activate Windows using a valid license
