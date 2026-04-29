@@ -5,6 +5,11 @@ param(
 )
 
 # =========================
+# VERSION
+# =========================
+$ScriptVersion = "1.1.0"
+
+# =========================
 # ENCODING FIX
 # =========================
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -63,7 +68,12 @@ function Section {
 $Patterns = "KMS|AutoKMS|AAct|Pico"
 
 # =========================
-# AUDIT START
+# START
+# =========================
+Log "KMS Cleanup Tool v$ScriptVersion"
+
+# =========================
+# AUDIT
 # =========================
 Section "AUDIT: Scheduled Tasks"
 
@@ -124,9 +134,9 @@ Section "AUDIT: Defender Exclusions"
 $def = Get-MpPreference
 
 if ($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension) {
-    $def.ExclusionPath | ForEach-Object { Log "Path exclusion: $_" }
-    $def.ExclusionProcess | ForEach-Object { Log "Process exclusion: $_" }
-    $def.ExclusionExtension | ForEach-Object { Log "Extension exclusion: $_" }
+    if ($def.ExclusionPath) { $def.ExclusionPath | % { Log "Path exclusion: $_" } }
+    if ($def.ExclusionProcess) { $def.ExclusionProcess | % { Log "Process exclusion: $_" } }
+    if ($def.ExclusionExtension) { $def.ExclusionExtension | % { Log "Extension exclusion: $_" } }
 } else {
     Log "No Defender exclusions"
 }
@@ -169,8 +179,8 @@ if ($services -and (Confirm "Remove services?")) {
 
 # ---- Defender ----
 if ($defSvc) {
-    if ($defSvc.Status -eq "Running") {
-        Log "Defender OK -> skip enable"
+    if ($defSvc.Status -eq "Running" -and $defSvc.StartType -eq "Automatic") {
+        Log "Defender OK -> skip"
     } else {
         if (Confirm "Enable Defender?") {
             try {
@@ -180,7 +190,7 @@ if ($defSvc) {
                     Set-MpPreference -DisableRealtimeMonitoring $false
                 }
             } catch {
-                Log "Defender blocked (Tamper Protection likely)"
+                Log "Access denied (Tamper Protection?)"
             }
         }
     }
@@ -188,10 +198,35 @@ if ($defSvc) {
 
 # ---- Exclusions ----
 if (($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension) -and (Confirm "Clear Defender exclusions?")) {
+
     if (-not $DryRun) {
-        $def.ExclusionPath | ForEach-Object { Remove-MpPreference -ExclusionPath $_ }
-        $def.ExclusionProcess | ForEach-Object { Remove-MpPreference -ExclusionProcess $_ }
-        $def.ExclusionExtension | ForEach-Object { Remove-MpPreference -ExclusionExtension $_ }
+
+        if ($def.ExclusionPath) {
+            foreach ($p in $def.ExclusionPath) {
+                if (![string]::IsNullOrWhiteSpace($p)) {
+                    Log "Removing path exclusion: $p"
+                    Remove-MpPreference -ExclusionPath $p
+                }
+            }
+        }
+
+        if ($def.ExclusionProcess) {
+            foreach ($p in $def.ExclusionProcess) {
+                if (![string]::IsNullOrWhiteSpace($p)) {
+                    Log "Removing process exclusion: $p"
+                    Remove-MpPreference -ExclusionProcess $p
+                }
+            }
+        }
+
+        if ($def.ExclusionExtension) {
+            foreach ($e in $def.ExclusionExtension) {
+                if (![string]::IsNullOrWhiteSpace($e)) {
+                    Log "Removing extension exclusion: $e"
+                    Remove-MpPreference -ExclusionExtension $e
+                }
+            }
+        }
     }
 }
 
