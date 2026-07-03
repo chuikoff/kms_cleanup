@@ -1,3 +1,5 @@
+#Requires -RunAsAdministrator
+
 param(
     [switch]$DryRun,
     [switch]$AutoApprove,
@@ -7,7 +9,7 @@ param(
 # =========================
 # VERSION
 # =========================
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.2.0"
 
 # =========================
 # ENCODING FIX
@@ -18,36 +20,43 @@ $ScriptVersion = "1.1.0"
 # LOGGER
 # =========================
 function Log {
-    param([string]$msg)
+    param([string]$Message)
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[$ts] $msg"
+    $line = "[$ts] $Message"
     Write-Host $line
-    Add-Content -Path $LogPath -Value $line
+    try {
+        Add-Content -Path $LogPath -Value $line -ErrorAction Stop
+    } catch {
+        Write-Warning "Failed to write log: $($_.Exception.Message)"
+    }
 }
 
 # =========================
 # CONFIRM
 # =========================
-function Confirm {
-    param([string]$msg)
-    if ($AutoApprove) { return $true }
-    $ans = Read-Host "$msg (y/n)"
-    return $ans -eq "y"
+function Confirm-Action {
+    param([string]$Message)
+    if ($AutoApprove -or $DryRun) { return $true }
+    $ans = Read-Host "$Message (y/n)"
+    return $ans -match '^[yY]'
 }
 
 # =========================
 # SLMGR WRAPPER
 # =========================
 function Run-Slmgr {
-    param([string]$args)
+    param([string]$SlmgrArgs)
 
-    $output = cscript.exe $env:SystemRoot\System32\slmgr.vbs $args 2>&1
+    try {
+        $output = cscript.exe $env:SystemRoot\System32\slmgr.vbs $SlmgrArgs 2>&1 | Out-String
 
-    if ($output -match "0xC004D302") {
-        Log "slmgr $args -> skipped (rearm limit reached)"
-    }
-    else {
-        Log "slmgr $args -> executed"
+        if ($output -match "0xC004D302") {
+            Log "slmgr $SlmgrArgs -> skipped (rearm limit reached)"
+        } else {
+            Log "slmgr $SlmgrArgs -> executed"
+        }
+    } catch {
+        Log "ERROR running slmgr $SlmgrArgs : $($_.Exception.Message)"
     }
 }
 
@@ -55,22 +64,42 @@ function Run-Slmgr {
 # SECTION HEADER
 # =========================
 function Section {
-    param([string]$name)
+    param([string]$Name)
     Log ""
     Log "=============================="
-    Log $name
+    Log $Name
     Log "=============================="
+}
+
+function Invoke-Remediation {
+    param(
+        [string]$Action,
+        [scriptblock]$ScriptBlock
+    )
+
+    $prefix = if ($DryRun) { "[DRY RUN] " } else { "" }
+    Log "$prefix$Action"
+
+    if (-not $DryRun) {
+        try {
+            & $ScriptBlock
+        } catch {
+            Log "ERROR: $($_.Exception.Message)"
+        }
+    }
 }
 
 # =========================
 # CONFIG
 # =========================
-$Patterns = "KMS|AutoKMS|AAct|Pico"
+$Patterns = 'AutoKMS|AAct(?:Net)?|KMSAuto|KMSSS|HEU[_\s]?KMS|Pico|Office\d+KMS|VLC[_\s]?KMS|KMSpico|KMSPico|KMS@Net'
+$ServiceAllowlist = @('SPPKMSvc')
 
 # =========================
 # START
 # =========================
-Log "KMS Cleanup Tool v$ScriptVersion"
+$mode = if ($DryRun) { "DRY RUN" } elseif ($AutoApprove) { "AUTO" } else { "INTERACTIVE" }
+Log "KMS Cleanup Tool v$ScriptVersion [$mode]"
 
 # =========================
 # AUDIT
@@ -83,7 +112,7 @@ $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
 
 if ($tasks) {
     $tasks | ForEach-Object {
-        Log "Task found: $($_.TaskName)"
+        Log "Task found: $($_.TaskPath)$($_.TaskName)"
     }
 } else {
     Log "No suspicious tasks"
@@ -91,8 +120,10 @@ if ($tasks) {
 
 Section "AUDIT: Services"
 
-$services = Get-CimInstance Win32_Service | Where-Object {
-    $_.Name -match $Patterns -or $_.PathName -match $Patterns
+$services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -notin $ServiceAllowlist -and (
+        $_.Name -match $Patterns -or $_.PathName -match $Patterns
+    )
 }
 
 if ($services) {
@@ -105,40 +136,74 @@ if ($services) {
 
 Section "AUDIT: Run Keys"
 
-$runHits = @()
+$runEntries = @()
 
 $runPaths = @(
-"HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
-"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 )
 
-foreach ($p in $runPaths) {
-    if (Test-Path $p) {
-        $props = Get-ItemProperty $p
-        foreach ($prop in $props.PSObject.Properties) {
-            if ($prop.Value -match $Patterns) {
-                $runHits += "$($prop.Name) => $($prop.Value)"
+foreach ($path in $runPaths) {
+    if (-not (Test-Path $path)) { continue }
+
+    $props = Get-ItemProperty $path
+    foreach ($prop in $props.PSObject.Properties) {
+        if ($prop.Name -like 'PS*') { continue }
+        if ($prop.Value -isnot [string]) { continue }
+        if ($prop.Value -match $Patterns) {
+            $runEntries += [PSCustomObject]@{
+                Path  = $path
+                Name  = $prop.Name
+                Value = $prop.Value
             }
+            Log "Run entry: $($prop.Name) => $($prop.Value) [$path]"
         }
     }
 }
 
-if ($runHits.Count -gt 0) {
-    $runHits | ForEach-Object { Log "Run entry: $_" }
-} else {
+if ($runEntries.Count -eq 0) {
     Log "No Run entries"
 }
 
 Section "AUDIT: Defender Exclusions"
 
-$def = Get-MpPreference
+$def = $null
+try {
+    $def = Get-MpPreference -ErrorAction Stop
+} catch {
+    Log "Cannot read Defender preferences: $($_.Exception.Message)"
+}
 
-if ($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension) {
-    if ($def.ExclusionPath) { $def.ExclusionPath | % { Log "Path exclusion: $_" } }
-    if ($def.ExclusionProcess) { $def.ExclusionProcess | % { Log "Process exclusion: $_" } }
-    if ($def.ExclusionExtension) { $def.ExclusionExtension | % { Log "Extension exclusion: $_" } }
+$suspiciousPaths = @()
+$suspiciousProcesses = @()
+$suspiciousExtensions = @()
+
+if ($def) {
+    if ($def.ExclusionPath) {
+        $suspiciousPaths = @($def.ExclusionPath | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -match $Patterns
+        })
+    }
+    if ($def.ExclusionProcess) {
+        $suspiciousProcesses = @($def.ExclusionProcess | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -match $Patterns
+        })
+    }
+    if ($def.ExclusionExtension) {
+        $suspiciousExtensions = @($def.ExclusionExtension | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -match $Patterns
+        })
+    }
+
+    if ($suspiciousPaths) { $suspiciousPaths | ForEach-Object { Log "Suspicious path exclusion: $_" } }
+    if ($suspiciousProcesses) { $suspiciousProcesses | ForEach-Object { Log "Suspicious process exclusion: $_" } }
+    if ($suspiciousExtensions) { $suspiciousExtensions | ForEach-Object { Log "Suspicious extension exclusion: $_" } }
+
+    if (-not $suspiciousPaths -and -not $suspiciousProcesses -and -not $suspiciousExtensions) {
+        Log "No suspicious Defender exclusions"
+    }
 } else {
-    Log "No Defender exclusions"
+    Log "Defender exclusions audit skipped"
 }
 
 Section "AUDIT: Defender Status"
@@ -157,22 +222,32 @@ if ($defSvc) {
 Section "REMEDIATION"
 
 # ---- Tasks ----
-if ($tasks -and (Confirm "Remove scheduled tasks?")) {
+if ($tasks -and (Confirm-Action "Remove scheduled tasks?")) {
     foreach ($t in $tasks) {
-        Log "Deleting task: $($t.TaskName)"
-        if (-not $DryRun) {
-            Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false
+        Invoke-Remediation "Deleting task: $($t.TaskPath)$($t.TaskName)" {
+            Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
         }
     }
 }
 
 # ---- Services ----
-if ($services -and (Confirm "Remove services?")) {
+if ($services -and (Confirm-Action "Remove services?")) {
     foreach ($s in $services) {
-        Log "Deleting service: $($s.Name)"
-        if (-not $DryRun) {
+        Invoke-Remediation "Deleting service: $($s.Name)" {
             Stop-Service $s.Name -Force -ErrorAction SilentlyContinue
-            sc.exe delete $s.Name | Out-Null
+            $result = sc.exe delete $s.Name 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "sc.exe delete failed: $result"
+            }
+        }
+    }
+}
+
+# ---- Run keys ----
+if ($runEntries.Count -gt 0 -and (Confirm-Action "Remove Run entries?")) {
+    foreach ($entry in $runEntries) {
+        Invoke-Remediation "Removing Run entry: $($entry.Name) from $($entry.Path)" {
+            Remove-ItemProperty -Path $entry.Path -Name $entry.Name -ErrorAction Stop
         }
     }
 }
@@ -181,58 +256,45 @@ if ($services -and (Confirm "Remove services?")) {
 if ($defSvc) {
     if ($defSvc.Status -eq "Running" -and $defSvc.StartType -eq "Automatic") {
         Log "Defender OK -> skip"
-    } else {
-        if (Confirm "Enable Defender?") {
-            try {
-                if (-not $DryRun) {
-                    Set-Service WinDefend -StartupType Automatic
-                    Start-Service WinDefend
-                    Set-MpPreference -DisableRealtimeMonitoring $false
-                }
-            } catch {
-                Log "Access denied (Tamper Protection?)"
+    } elseif (Confirm-Action "Enable Defender?") {
+        Invoke-Remediation "Enabling Defender" {
+            Set-Service WinDefend -StartupType Automatic -ErrorAction Stop
+            Start-Service WinDefend -ErrorAction Stop
+            if ($def) {
+                Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
             }
         }
     }
 }
 
 # ---- Exclusions ----
-if (($def.ExclusionPath -or $def.ExclusionProcess -or $def.ExclusionExtension) -and (Confirm "Clear Defender exclusions?")) {
+$hasSuspiciousExclusions = $suspiciousPaths -or $suspiciousProcesses -or $suspiciousExtensions
 
-    if (-not $DryRun) {
-
-        if ($def.ExclusionPath) {
-            foreach ($p in $def.ExclusionPath) {
-                if (![string]::IsNullOrWhiteSpace($p)) {
-                    Log "Removing path exclusion: $p"
-                    Remove-MpPreference -ExclusionPath $p
-                }
-            }
+if ($hasSuspiciousExclusions -and $def -and (Confirm-Action "Clear suspicious Defender exclusions?")) {
+    foreach ($p in $suspiciousPaths) {
+        Invoke-Remediation "Removing path exclusion: $p" {
+            Remove-MpPreference -ExclusionPath $p -ErrorAction Stop
         }
+    }
 
-        if ($def.ExclusionProcess) {
-            foreach ($p in $def.ExclusionProcess) {
-                if (![string]::IsNullOrWhiteSpace($p)) {
-                    Log "Removing process exclusion: $p"
-                    Remove-MpPreference -ExclusionProcess $p
-                }
-            }
+    foreach ($p in $suspiciousProcesses) {
+        Invoke-Remediation "Removing process exclusion: $p" {
+            Remove-MpPreference -ExclusionProcess $p -ErrorAction Stop
         }
+    }
 
-        if ($def.ExclusionExtension) {
-            foreach ($e in $def.ExclusionExtension) {
-                if (![string]::IsNullOrWhiteSpace($e)) {
-                    Log "Removing extension exclusion: $e"
-                    Remove-MpPreference -ExclusionExtension $e
-                }
-            }
+    foreach ($e in $suspiciousExtensions) {
+        Invoke-Remediation "Removing extension exclusion: $e" {
+            Remove-MpPreference -ExclusionExtension $e -ErrorAction Stop
         }
     }
 }
 
 # ---- Activation ----
-if (Confirm "Reset Windows activation?") {
-    if (-not $DryRun) {
+if (Confirm-Action "Reset Windows activation?") {
+    if ($DryRun) {
+        Log "[DRY RUN] Would run: slmgr /upk, /ckms, /rearm"
+    } else {
         Run-Slmgr "/upk"
         Run-Slmgr "/ckms"
         Run-Slmgr "/rearm"
