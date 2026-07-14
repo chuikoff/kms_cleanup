@@ -12,7 +12,7 @@ param(
 # =========================
 # VERSION
 # =========================
-$ScriptVersion = "1.0.0"
+$ScriptVersion = "1.0.1"
 
 # =========================
 # ENCODING FIX
@@ -119,38 +119,31 @@ function Test-CommandAvailable {
 function Get-CompatScheduledTasks {
     param([string]$Pattern)
 
-    if (Test-CommandAvailable 'Get-ScheduledTask') {
-        $found = @()
-        Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($_.TaskName -match $Pattern) {
-                $found += New-CompatObject @{
-                    DisplayName = "$($_.TaskPath)$($_.TaskName)"
-                    TaskName    = $_.TaskName
-                    TaskPath    = $_.TaskPath
-                    FullName    = "$($_.TaskPath)$($_.TaskName)"
-                    Method      = 'Cmdlet'
-                }
-            }
-        }
-        return $found
-    }
-
     $found = @()
     $taskRoot = Join-Path $env:SystemRoot 'System32\Tasks'
     if (-not (Test-Path $taskRoot)) { return $found }
 
-    Get-ChildItem -Path $taskRoot -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-        $relative = $_.FullName.Substring($taskRoot.Length).TrimStart('\')
-        $fullName = '\' + $relative
-        if ($fullName -match $Pattern -or $_.Name -match $Pattern) {
-            $found += New-CompatObject @{
-                DisplayName = $fullName
-                TaskName    = $fullName
-                TaskPath    = $null
-                FullName    = $fullName
-                Method      = 'SchTasks'
+    try {
+        Log "Scanning task folder (may take a moment)..."
+        $items = Get-ChildItem -Path $taskRoot -Recurse -ErrorAction SilentlyContinue
+        foreach ($item in $items) {
+            if ($item.PSIsContainer) { continue }
+
+            $relative = $item.FullName.Substring($taskRoot.Length)
+            $relative = $relative.TrimStart('\')
+            $fullName = '\' + $relative
+            if ($fullName -match $Pattern -or $item.Name -match $Pattern) {
+                $found += New-CompatObject @{
+                    DisplayName = $fullName
+                    TaskName    = $fullName
+                    TaskPath    = $null
+                    FullName    = $fullName
+                    Method      = 'SchTasks'
+                }
             }
         }
+    } catch {
+        Log "ERROR scanning scheduled tasks: $($_.Exception.Message)"
     }
 
     return $found
@@ -158,11 +151,6 @@ function Get-CompatScheduledTasks {
 
 function Remove-CompatScheduledTask {
     param($Task)
-
-    if ($Task.Method -eq 'Cmdlet') {
-        Unregister-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -Confirm:$false -ErrorAction Stop
-        return
-    }
 
     $result = & schtasks.exe /delete /tn $Task.FullName /f 2>&1
     if (-not $?) {
@@ -329,11 +317,16 @@ if (-not (Test-IsAdministrator)) {
 $mode = if ($DryRun) { "DRY RUN" } elseif ($AutoApprove) { "AUTO" } else { "INTERACTIVE" }
 $os = [System.Environment]::OSVersion.Version
 $psVer = $PSVersionTable.PSVersion.ToString()
-$taskMethod = if (Test-CommandAvailable 'Get-ScheduledTask') { 'Get-ScheduledTask' } else { 'Tasks folder + schtasks.exe' }
+$taskMethod = 'Tasks folder + schtasks.exe'
 $defMethod = if (Test-CommandAvailable 'Get-MpPreference') { 'Get-MpPreference' } else { 'Registry' }
 
 Log "KMS Cleanup Tool for Windows 7 v$ScriptVersion [$mode]"
 Log "OS: $($os.Major).$($os.Minor) | PowerShell: $psVer | Tasks: $taskMethod | Defender exclusions: $defMethod"
+
+trap {
+    Log "FATAL: $($_.Exception.Message)"
+    exit 1
+}
 
 # =========================
 # AUDIT
@@ -434,7 +427,7 @@ if ($tasks.Count -gt 0 -and (Confirm-Action "Remove scheduled tasks?")) {
 if ($services.Count -gt 0 -and (Confirm-Action "Remove services?")) {
     foreach ($s in $services) {
         Invoke-Remediation "Deleting service: $($s.Name)" {
-            Stop-Service $s.Name -Force -ErrorAction SilentlyContinue
+            Stop-Service $s.Name -ErrorAction SilentlyContinue
             $result = & sc.exe delete $s.Name 2>&1
             if (-not $?) {
                 throw "sc.exe delete failed: $result"
