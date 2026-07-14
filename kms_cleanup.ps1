@@ -1,4 +1,4 @@
-#Requires -Version 2.0
+#Requires -RunAsAdministrator
 
 param(
     [switch]$DryRun,
@@ -9,7 +9,7 @@ param(
 # =========================
 # VERSION
 # =========================
-$ScriptVersion = "1.3.0"
+$ScriptVersion = "1.2.0"
 
 # =========================
 # ENCODING FIX
@@ -89,226 +89,6 @@ function Invoke-Remediation {
     }
 }
 
-function Test-IsAdministrator {
-    $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    return $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Test-IsNullOrWhiteSpace {
-    param([string]$Value)
-    if ($null -eq $Value) { return $true }
-    return [string]::IsNullOrEmpty($Value) -or $Value.Trim().Length -eq 0
-}
-
-function New-CompatObject {
-    param([hashtable]$Properties)
-    if ($PSVersionTable.PSVersion.Major -ge 3) {
-        return [PSCustomObject]$Properties
-    }
-    return New-Object PSObject -Property $Properties
-}
-
-function Test-CommandAvailable {
-    param([string]$Name)
-    return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
-}
-
-function Get-CompatScheduledTasks {
-    param([string]$Pattern)
-
-    if (Test-CommandAvailable 'Get-ScheduledTask') {
-        $found = @()
-        Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($_.TaskName -match $Pattern) {
-                $found += New-CompatObject @{
-                    DisplayName = "$($_.TaskPath)$($_.TaskName)"
-                    TaskName    = $_.TaskName
-                    TaskPath    = $_.TaskPath
-                    FullName    = "$($_.TaskPath)$($_.TaskName)"
-                    Method      = 'Cmdlet'
-                }
-            }
-        }
-        return $found
-    }
-
-    $found = @()
-    $taskRoot = Join-Path $env:SystemRoot 'System32\Tasks'
-    if (-not (Test-Path $taskRoot)) { return $found }
-
-    Get-ChildItem -Path $taskRoot -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-        $relative = $_.FullName.Substring($taskRoot.Length).TrimStart('\')
-        $fullName = '\' + $relative
-        if ($fullName -match $Pattern -or $_.Name -match $Pattern) {
-            $found += New-CompatObject @{
-                DisplayName = $fullName
-                TaskName    = $fullName
-                TaskPath    = $null
-                FullName    = $fullName
-                Method      = 'SchTasks'
-            }
-        }
-    }
-
-    return $found
-}
-
-function Remove-CompatScheduledTask {
-    param($Task)
-
-    if ($Task.Method -eq 'Cmdlet') {
-        Unregister-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -Confirm:$false -ErrorAction Stop
-        return
-    }
-
-    $result = & schtasks.exe /delete /tn $Task.FullName /f 2>&1
-    if (-not $?) {
-        throw "schtasks delete failed: $result"
-    }
-}
-
-function Get-CompatServices {
-    param(
-        [string]$Pattern,
-        [string[]]$Allowlist
-    )
-
-    $services = @()
-    if (Test-CommandAvailable 'Get-CimInstance') {
-        $services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue)
-    } else {
-        $services = @(Get-WmiObject Win32_Service -ErrorAction SilentlyContinue)
-    }
-
-    $matched = @()
-    foreach ($svc in $services) {
-        if ($Allowlist -contains $svc.Name) { continue }
-        if ($svc.Name -match $Pattern -or ($svc.PathName -and $svc.PathName -match $Pattern)) {
-            $matched += $svc
-        }
-    }
-    return $matched
-}
-
-function Get-DefenderService {
-    foreach ($name in @('WinDefend', 'MsMpSvc')) {
-        $svc = Get-Service $name -ErrorAction SilentlyContinue
-        if ($svc) { return $svc }
-    }
-    return $null
-}
-
-function Get-DefenderExclusionRoots {
-    return @(
-        'HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions',
-        'HKLM:\SOFTWARE\Microsoft\Microsoft Antimalware\Exclusions'
-    )
-}
-
-function Get-CompatDefenderExclusions {
-    param([string]$Pattern)
-
-    $items = @()
-
-    if (Test-CommandAvailable 'Get-MpPreference') {
-        try {
-            $def = Get-MpPreference -ErrorAction Stop
-            if ($def.ExclusionPath) {
-                foreach ($value in $def.ExclusionPath) {
-                    if (-not (Test-IsNullOrWhiteSpace $value) -and $value -match $Pattern) {
-                        $items += New-CompatObject @{
-                            Type         = 'Path'
-                            Value        = $value
-                            Source       = 'MpPreference'
-                            RegistryPath = $null
-                        }
-                    }
-                }
-            }
-            if ($def.ExclusionProcess) {
-                foreach ($value in $def.ExclusionProcess) {
-                    if (-not (Test-IsNullOrWhiteSpace $value) -and $value -match $Pattern) {
-                        $items += New-CompatObject @{
-                            Type         = 'Process'
-                            Value        = $value
-                            Source       = 'MpPreference'
-                            RegistryPath = $null
-                        }
-                    }
-                }
-            }
-            if ($def.ExclusionExtension) {
-                foreach ($value in $def.ExclusionExtension) {
-                    if (-not (Test-IsNullOrWhiteSpace $value) -and $value -match $Pattern) {
-                        $items += New-CompatObject @{
-                            Type         = 'Extension'
-                            Value        = $value
-                            Source       = 'MpPreference'
-                            RegistryPath = $null
-                        }
-                    }
-                }
-            }
-            return $items
-        } catch {
-            Log "Get-MpPreference unavailable, using registry fallback: $($_.Exception.Message)"
-        }
-    }
-
-    $map = @{
-        'Paths'     = 'Path'
-        'Processes' = 'Process'
-        'Extensions' = 'Extension'
-    }
-
-    foreach ($root in (Get-DefenderExclusionRoots)) {
-        foreach ($subKey in $map.Keys) {
-            $keyPath = Join-Path $root $subKey
-            if (-not (Test-Path $keyPath)) { continue }
-
-            $key = Get-Item $keyPath
-            foreach ($propName in $key.Property) {
-                if (-not (Test-IsNullOrWhiteSpace $propName) -and $propName -match $Pattern) {
-                    $items += New-CompatObject @{
-                        Type         = $map[$subKey]
-                        Value        = $propName
-                        Source       = 'Registry'
-                        RegistryPath = $keyPath
-                    }
-                }
-            }
-        }
-    }
-
-    return $items
-}
-
-function Remove-CompatDefenderExclusion {
-    param($Item)
-
-    if ($Item.Source -eq 'MpPreference') {
-        switch ($Item.Type) {
-            'Path'      { Remove-MpPreference -ExclusionPath $Item.Value -ErrorAction Stop }
-            'Process'   { Remove-MpPreference -ExclusionProcess $Item.Value -ErrorAction Stop }
-            'Extension' { Remove-MpPreference -ExclusionExtension $Item.Value -ErrorAction Stop }
-        }
-        return
-    }
-
-    Remove-ItemProperty -Path $Item.RegistryPath -Name $Item.Value -ErrorAction Stop
-}
-
-function Enable-CompatDefender {
-    param($Service, [bool]$HasMpPreference)
-
-    Set-Service $Service.Name -StartupType Automatic -ErrorAction Stop
-    Start-Service $Service.Name -ErrorAction Stop
-
-    if ($HasMpPreference) {
-        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
-    }
-}
-
 # =========================
 # CONFIG
 # =========================
@@ -318,30 +98,21 @@ $ServiceAllowlist = @('SPPKMSvc')
 # =========================
 # START
 # =========================
-if (-not (Test-IsAdministrator)) {
-    Write-Error "Administrator rights required. Run PowerShell as Administrator."
-    exit 1
-}
-
 $mode = if ($DryRun) { "DRY RUN" } elseif ($AutoApprove) { "AUTO" } else { "INTERACTIVE" }
-$os = [System.Environment]::OSVersion.Version
-$psVer = $PSVersionTable.PSVersion.ToString()
-$taskMethod = if (Test-CommandAvailable 'Get-ScheduledTask') { 'Get-ScheduledTask' } else { 'Tasks folder + schtasks.exe' }
-$defMethod = if (Test-CommandAvailable 'Get-MpPreference') { 'Get-MpPreference' } else { 'Registry' }
-
 Log "KMS Cleanup Tool v$ScriptVersion [$mode]"
-Log "OS: $($os.Major).$($os.Minor) | PowerShell: $psVer | Tasks: $taskMethod | Defender exclusions: $defMethod"
 
 # =========================
 # AUDIT
 # =========================
 Section "AUDIT: Scheduled Tasks"
 
-$tasks = @(Get-CompatScheduledTasks -Pattern $Patterns)
+$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+    $_.TaskName -match $Patterns
+}
 
-if ($tasks.Count -gt 0) {
+if ($tasks) {
     $tasks | ForEach-Object {
-        Log "Task found: $($_.DisplayName)"
+        Log "Task found: $($_.TaskPath)$($_.TaskName)"
     }
 } else {
     Log "No suspicious tasks"
@@ -349,9 +120,13 @@ if ($tasks.Count -gt 0) {
 
 Section "AUDIT: Services"
 
-$services = @(Get-CompatServices -Pattern $Patterns -Allowlist $ServiceAllowlist)
+$services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -notin $ServiceAllowlist -and (
+        $_.Name -match $Patterns -or $_.PathName -match $Patterns
+    )
+}
 
-if ($services.Count -gt 0) {
+if ($services) {
     $services | ForEach-Object {
         Log "Service found: $($_.Name) | $($_.PathName)"
     }
@@ -374,9 +149,9 @@ foreach ($path in $runPaths) {
     $props = Get-ItemProperty $path
     foreach ($prop in $props.PSObject.Properties) {
         if ($prop.Name -like 'PS*') { continue }
-        if (-not ($prop.Value -is [string])) { continue }
+        if ($prop.Value -isnot [string]) { continue }
         if ($prop.Value -match $Patterns) {
-            $runEntries += New-CompatObject @{
+            $runEntries += [PSCustomObject]@{
                 Path  = $path
                 Name  = $prop.Name
                 Value = $prop.Value
@@ -392,25 +167,53 @@ if ($runEntries.Count -eq 0) {
 
 Section "AUDIT: Defender Exclusions"
 
-$suspiciousExclusions = @(Get-CompatDefenderExclusions -Pattern $Patterns)
-$HasMpPreference = Test-CommandAvailable 'Get-MpPreference'
+$def = $null
+try {
+    $def = Get-MpPreference -ErrorAction Stop
+} catch {
+    Log "Cannot read Defender preferences: $($_.Exception.Message)"
+}
 
-if ($suspiciousExclusions.Count -gt 0) {
-    foreach ($item in $suspiciousExclusions) {
-        Log "Suspicious $($item.Type.ToLower()) exclusion: $($item.Value) [$($item.Source)]"
+$suspiciousPaths = @()
+$suspiciousProcesses = @()
+$suspiciousExtensions = @()
+
+if ($def) {
+    if ($def.ExclusionPath) {
+        $suspiciousPaths = @($def.ExclusionPath | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -match $Patterns
+        })
+    }
+    if ($def.ExclusionProcess) {
+        $suspiciousProcesses = @($def.ExclusionProcess | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -match $Patterns
+        })
+    }
+    if ($def.ExclusionExtension) {
+        $suspiciousExtensions = @($def.ExclusionExtension | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -match $Patterns
+        })
+    }
+
+    if ($suspiciousPaths) { $suspiciousPaths | ForEach-Object { Log "Suspicious path exclusion: $_" } }
+    if ($suspiciousProcesses) { $suspiciousProcesses | ForEach-Object { Log "Suspicious process exclusion: $_" } }
+    if ($suspiciousExtensions) { $suspiciousExtensions | ForEach-Object { Log "Suspicious extension exclusion: $_" } }
+
+    if (-not $suspiciousPaths -and -not $suspiciousProcesses -and -not $suspiciousExtensions) {
+        Log "No suspicious Defender exclusions"
     }
 } else {
-    Log "No suspicious Defender exclusions"
+    Log "Defender exclusions audit skipped"
 }
 
 Section "AUDIT: Defender Status"
 
-$defSvc = Get-DefenderService
+$defSvc = Get-Service WinDefend -ErrorAction SilentlyContinue
 
 if ($defSvc) {
-    Log "Defender: $($defSvc.Name) / $($defSvc.Status) / $($defSvc.StartType)"
+    Log "Defender: $($defSvc.Status) / $($defSvc.StartType)"
 } else {
-    Log "Defender service missing (WinDefend, MsMpSvc)"
+    Log "Defender service missing"
 }
 
 # =========================
@@ -419,21 +222,21 @@ if ($defSvc) {
 Section "REMEDIATION"
 
 # ---- Tasks ----
-if ($tasks.Count -gt 0 -and (Confirm-Action "Remove scheduled tasks?")) {
+if ($tasks -and (Confirm-Action "Remove scheduled tasks?")) {
     foreach ($t in $tasks) {
-        Invoke-Remediation "Deleting task: $($t.DisplayName)" {
-            Remove-CompatScheduledTask -Task $t
+        Invoke-Remediation "Deleting task: $($t.TaskPath)$($t.TaskName)" {
+            Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
         }
     }
 }
 
 # ---- Services ----
-if ($services.Count -gt 0 -and (Confirm-Action "Remove services?")) {
+if ($services -and (Confirm-Action "Remove services?")) {
     foreach ($s in $services) {
         Invoke-Remediation "Deleting service: $($s.Name)" {
             Stop-Service $s.Name -Force -ErrorAction SilentlyContinue
-            $result = & sc.exe delete $s.Name 2>&1
-            if (-not $?) {
+            $result = sc.exe delete $s.Name 2>&1
+            if ($LASTEXITCODE -ne 0) {
                 throw "sc.exe delete failed: $result"
             }
         }
@@ -454,17 +257,35 @@ if ($defSvc) {
     if ($defSvc.Status -eq "Running" -and $defSvc.StartType -eq "Automatic") {
         Log "Defender OK -> skip"
     } elseif (Confirm-Action "Enable Defender?") {
-        Invoke-Remediation "Enabling Defender ($($defSvc.Name))" {
-            Enable-CompatDefender -Service $defSvc -HasMpPreference $HasMpPreference
+        Invoke-Remediation "Enabling Defender" {
+            Set-Service WinDefend -StartupType Automatic -ErrorAction Stop
+            Start-Service WinDefend -ErrorAction Stop
+            if ($def) {
+                Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
+            }
         }
     }
 }
 
 # ---- Exclusions ----
-if ($suspiciousExclusions.Count -gt 0 -and (Confirm-Action "Clear suspicious Defender exclusions?")) {
-    foreach ($item in $suspiciousExclusions) {
-        Invoke-Remediation "Removing $($item.Type.ToLower()) exclusion: $($item.Value)" {
-            Remove-CompatDefenderExclusion -Item $item
+$hasSuspiciousExclusions = $suspiciousPaths -or $suspiciousProcesses -or $suspiciousExtensions
+
+if ($hasSuspiciousExclusions -and $def -and (Confirm-Action "Clear suspicious Defender exclusions?")) {
+    foreach ($p in $suspiciousPaths) {
+        Invoke-Remediation "Removing path exclusion: $p" {
+            Remove-MpPreference -ExclusionPath $p -ErrorAction Stop
+        }
+    }
+
+    foreach ($p in $suspiciousProcesses) {
+        Invoke-Remediation "Removing process exclusion: $p" {
+            Remove-MpPreference -ExclusionProcess $p -ErrorAction Stop
+        }
+    }
+
+    foreach ($e in $suspiciousExtensions) {
+        Invoke-Remediation "Removing extension exclusion: $e" {
+            Remove-MpPreference -ExclusionExtension $e -ErrorAction Stop
         }
     }
 }
