@@ -1,23 +1,44 @@
-# KMS Cleanup Tool — Windows 7 edition
-# Requires PowerShell 2.0+, run as Administrator
-
-#Requires -Version 2.0
+﻿# KMS Cleanup Tool - Windows 7 edition
+# PowerShell 2.0+, run as Administrator
 
 param(
     [switch]$DryRun,
     [switch]$AutoApprove,
-    [string]$LogPath = "$PSScriptRoot\kms_cleanup_win7.log"
+    [string]$LogPath = $null
 )
 
-# =========================
-# VERSION
-# =========================
-$ScriptVersion = "1.0.1"
+$ScriptVersion = "1.0.2"
 
-# =========================
-# ENCODING FIX
-# =========================
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $ScriptDir) {
+    $ScriptDir = (Get-Location).Path
+}
+if (-not $LogPath) {
+    $LogPath = Join-Path $ScriptDir "kms_cleanup_win7.log"
+}
+$BootLogPath = Join-Path $ScriptDir "kms_cleanup_win7_boot.log"
+
+function Write-BootLog {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] $Message"
+    Write-Host $line
+    try {
+        Add-Content -Path $BootLogPath -Value $line -ErrorAction SilentlyContinue
+    } catch {
+    }
+}
+
+Write-BootLog "Boot OK v$ScriptVersion dir=$ScriptDir"
+
+trap {
+    Write-BootLog "FATAL: $($_.Exception.Message)"
+    try {
+        Add-Content -Path $LogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] FATAL: $($_.Exception.Message)" -ErrorAction SilentlyContinue
+    } catch {
+    }
+    exit 1
+}
 
 # =========================
 # LOGGER
@@ -30,7 +51,7 @@ function Log {
     try {
         Add-Content -Path $LogPath -Value $line -ErrorAction Stop
     } catch {
-        Write-Warning "Failed to write log: $($_.Exception.Message)"
+        Write-BootLog "Log write failed: $($_.Exception.Message)"
     }
 }
 
@@ -120,7 +141,7 @@ function Get-CompatScheduledTasks {
     param([string]$Pattern)
 
     $found = @()
-    $taskRoot = Join-Path $env:SystemRoot 'System32\Tasks'
+    $taskRoot = Join-Path $env:SystemRoot "System32\Tasks"
     if (-not (Test-Path $taskRoot)) { return $found }
 
     try {
@@ -152,9 +173,9 @@ function Get-CompatScheduledTasks {
 function Remove-CompatScheduledTask {
     param($Task)
 
-    $result = & schtasks.exe /delete /tn $Task.FullName /f 2>&1
+    $null = & schtasks.exe /delete /tn $Task.FullName /f 2>&1
     if (-not $?) {
-        throw "schtasks delete failed: $result"
+        throw "schtasks delete failed"
     }
 }
 
@@ -164,12 +185,7 @@ function Get-CompatServices {
         [string[]]$Allowlist
     )
 
-    $services = @()
-    if (Test-CommandAvailable 'Get-CimInstance') {
-        $services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue)
-    } else {
-        $services = @(Get-WmiObject Win32_Service -ErrorAction SilentlyContinue)
-    }
+    $services = @(Get-WmiObject Win32_Service -ErrorAction SilentlyContinue)
 
     $matched = @()
     foreach ($svc in $services) {
@@ -247,8 +263,8 @@ function Get-CompatDefenderExclusions {
     }
 
     $map = @{
-        'Paths'     = 'Path'
-        'Processes' = 'Process'
+        'Paths'      = 'Path'
+        'Processes'  = 'Process'
         'Extensions' = 'Extension'
     }
 
@@ -290,7 +306,10 @@ function Remove-CompatDefenderExclusion {
 }
 
 function Enable-CompatDefender {
-    param($Service, [bool]$HasMpPreference)
+    param(
+        $Service,
+        [bool]$HasMpPreference
+    )
 
     Set-Service $Service.Name -StartupType Automatic -ErrorAction Stop
     Start-Service $Service.Name -ErrorAction Stop
@@ -310,7 +329,8 @@ $ServiceAllowlist = @('SPPKMSvc')
 # START
 # =========================
 if (-not (Test-IsAdministrator)) {
-    Write-Error "Administrator rights required. Run PowerShell as Administrator."
+    Write-BootLog "ERROR: Administrator rights required"
+    Write-Error "Administrator rights required. Run as Administrator."
     exit 1
 }
 
@@ -322,11 +342,6 @@ $defMethod = if (Test-CommandAvailable 'Get-MpPreference') { 'Get-MpPreference' 
 
 Log "KMS Cleanup Tool for Windows 7 v$ScriptVersion [$mode]"
 Log "OS: $($os.Major).$($os.Minor) | PowerShell: $psVer | Tasks: $taskMethod | Defender exclusions: $defMethod"
-
-trap {
-    Log "FATAL: $($_.Exception.Message)"
-    exit 1
-}
 
 # =========================
 # AUDIT
@@ -414,7 +429,6 @@ if ($defSvc) {
 # =========================
 Section "REMEDIATION"
 
-# ---- Tasks ----
 if ($tasks.Count -gt 0 -and (Confirm-Action "Remove scheduled tasks?")) {
     foreach ($t in $tasks) {
         Invoke-Remediation "Deleting task: $($t.DisplayName)" {
@@ -423,20 +437,18 @@ if ($tasks.Count -gt 0 -and (Confirm-Action "Remove scheduled tasks?")) {
     }
 }
 
-# ---- Services ----
 if ($services.Count -gt 0 -and (Confirm-Action "Remove services?")) {
     foreach ($s in $services) {
         Invoke-Remediation "Deleting service: $($s.Name)" {
             Stop-Service $s.Name -ErrorAction SilentlyContinue
-            $result = & sc.exe delete $s.Name 2>&1
+            $null = & sc.exe delete $s.Name 2>&1
             if (-not $?) {
-                throw "sc.exe delete failed: $result"
+                throw "sc.exe delete failed"
             }
         }
     }
 }
 
-# ---- Run keys ----
 if ($runEntries.Count -gt 0 -and (Confirm-Action "Remove Run entries?")) {
     foreach ($entry in $runEntries) {
         Invoke-Remediation "Removing Run entry: $($entry.Name) from $($entry.Path)" {
@@ -445,7 +457,6 @@ if ($runEntries.Count -gt 0 -and (Confirm-Action "Remove Run entries?")) {
     }
 }
 
-# ---- Defender ----
 if ($defSvc) {
     if ($defSvc.Status -eq "Running" -and $defSvc.StartType -eq "Automatic") {
         Log "Defender OK -> skip"
@@ -456,7 +467,6 @@ if ($defSvc) {
     }
 }
 
-# ---- Exclusions ----
 if ($suspiciousExclusions.Count -gt 0 -and (Confirm-Action "Clear suspicious Defender exclusions?")) {
     foreach ($item in $suspiciousExclusions) {
         Invoke-Remediation "Removing $($item.Type.ToLower()) exclusion: $($item.Value)" {
@@ -465,7 +475,6 @@ if ($suspiciousExclusions.Count -gt 0 -and (Confirm-Action "Clear suspicious Def
     }
 }
 
-# ---- Activation ----
 if (Confirm-Action "Reset Windows activation?") {
     if ($DryRun) {
         Log "[DRY RUN] Would run: slmgr /upk, /ckms, /rearm"
@@ -478,3 +487,4 @@ if (Confirm-Action "Reset Windows activation?") {
 
 Section "DONE"
 Log "Reboot recommended"
+Write-BootLog "Finished OK"
